@@ -1,0 +1,260 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity spi_master_timer is
+    generic (
+        DATA_WIDTH : integer := 8
+    );
+    port (
+        clk         : in  std_logic;
+        rst_n       : in  std_logic;
+        start       : in  std_logic;
+        tx_data     : in  std_logic_vector(DATA_WIDTH-1 downto 0);
+        clk_div     : in  std_logic_vector(7 downto 0);
+        clear_flags : in  std_logic;
+        busy        : out std_logic;
+        busy_sticky : out std_logic;
+        done        : out std_logic;
+        done_sticky : out std_logic;
+        rx_data     : out std_logic_vector(DATA_WIDTH-1 downto 0);
+        cycle_count : out std_logic_vector(15 downto 0);
+        cycle_count_live : out std_logic_vector(15 downto 0);
+        debug_state : out std_logic_vector(1 downto 0);
+        debug_bit_cnt : out std_logic_vector(7 downto 0);
+        spi_sclk    : out std_logic;
+        spi_mosi    : out std_logic;
+        spi_miso    : in  std_logic;
+        spi_cs_n    : out std_logic
+    );
+end spi_master_timer;
+
+architecture rtl of spi_master_timer is
+
+    type state_type is (IDLE, SETUP, TRANSFER, HOLD);
+    signal state : state_type := IDLE;
+
+    signal shift_reg_tx : std_logic_vector(DATA_WIDTH-1 downto 0) := (others => '0');
+    signal shift_reg_rx : std_logic_vector(DATA_WIDTH-1 downto 0) := (others => '0');
+    signal rx_data_reg  : std_logic_vector(DATA_WIDTH-1 downto 0) := (others => '0');
+    signal mosi_reg     : std_logic := '0';
+    
+    signal miso_sync1   : std_logic := '0';
+    signal miso_sync2   : std_logic := '0';
+
+    signal bit_cnt      : unsigned(7 downto 0) := (others => '0');
+
+    signal clk_cnt      : unsigned(7 downto 0) := (others => '0');
+    signal sclk_rise    : std_logic := '0';
+    signal sclk_fall    : std_logic := '0';
+    signal sclk_int     : std_logic := '0';
+    
+    signal transfer_active : std_logic := '0';
+    signal cs_active       : std_logic := '0';
+    signal done_pulse      : std_logic := '0';
+    
+    signal busy_sticky_reg : std_logic := '0';
+    signal done_sticky_reg : std_logic := '0';
+    
+    signal cycle_cnt          : unsigned(15 downto 0) := (others => '0');
+    signal cycle_cnt_snapshot : unsigned(15 downto 0) := (others => '0');
+    signal counting_active    : std_logic := '0';
+
+begin
+
+    spi_sclk    <= sclk_int;
+    spi_cs_n    <= not cs_active;
+    spi_mosi    <= mosi_reg;
+    busy        <= transfer_active;
+    busy_sticky <= busy_sticky_reg;
+    done_sticky <= done_sticky_reg;
+    done        <= done_pulse;
+    rx_data     <= rx_data_reg;
+    cycle_count      <= std_logic_vector(cycle_cnt_snapshot);
+    cycle_count_live <= std_logic_vector(cycle_cnt);
+    
+    debug_state <= "00" when state = IDLE else
+                   "01" when state = SETUP else
+                   "10" when state = TRANSFER else
+                   "11";
+    debug_bit_cnt <= std_logic_vector(bit_cnt);
+
+    -- MISO Synchronizer
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if rst_n = '0' then
+                miso_sync1 <= '0';
+                miso_sync2 <= '0';
+            else
+                miso_sync1 <= spi_miso;
+                miso_sync2 <= miso_sync1;
+            end if;
+        end if;
+    end process;
+
+    -- SCLK Generation
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if rst_n = '0' then
+                clk_cnt   <= (others => '0');
+                sclk_int  <= '0';
+                sclk_rise <= '0';
+                sclk_fall <= '0';
+            else
+                sclk_rise <= '0';
+                sclk_fall <= '0';
+
+                if transfer_active = '1' then
+                    if clk_cnt = unsigned(clk_div) then
+                        clk_cnt  <= (others => '0');
+                        sclk_int <= not sclk_int;
+                        
+                        if sclk_int = '0' then
+                            sclk_rise <= '1';
+                        else
+                            sclk_fall <= '1';
+                        end if;
+                    else
+                        clk_cnt <= clk_cnt + 1;
+                    end if;
+                else
+                    clk_cnt  <= (others => '0');
+                    sclk_int <= '0';
+                end if;
+            end if;
+        end if;
+    end process;
+
+    -- ===================================================================
+    -- OPTIMIZED FSM - Clean logic, no redundant operations
+    -- ===================================================================
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if rst_n = '0' then
+                state           <= IDLE;
+                shift_reg_tx    <= (others => '0');
+                shift_reg_rx    <= (others => '0');
+                rx_data_reg     <= (others => '0');
+                mosi_reg        <= '0';
+                bit_cnt         <= (others => '0');
+                transfer_active <= '0';
+                cs_active       <= '0';
+                done_pulse      <= '0';
+                
+            else
+                done_pulse <= '0';
+                
+                case state is
+                
+                    when IDLE =>
+                        transfer_active <= '0';
+                        cs_active       <= '0';
+                        bit_cnt         <= (others => '0');
+                        mosi_reg        <= '0';
+                        
+                        if start = '1' then
+                            shift_reg_tx    <= tx_data;
+                            cs_active       <= '1';
+                            mosi_reg        <= tx_data(DATA_WIDTH-1);
+                            state           <= SETUP;
+                        end if;
+
+                    when SETUP =>
+                        cs_active       <= '1';
+                        transfer_active <= '1';
+                        state           <= TRANSFER;
+
+                    when TRANSFER =>
+                        transfer_active <= '1';
+                        cs_active       <= '1';
+                        
+                        -- ? FIX 1: RISING edge - Sample MISO, ch? t?ng bit_cnt khi ch?a xong
+                        if sclk_rise = '1' then
+                            shift_reg_rx <= shift_reg_rx(DATA_WIDTH-2 downto 0) & miso_sync2;
+                            
+                            if bit_cnt = DATA_WIDTH - 1 then
+                                -- Bit cu?i cùng - l?u data và chuy?n state
+                                rx_data_reg <= shift_reg_rx(DATA_WIDTH-2 downto 0) & miso_sync2;
+                                state <= HOLD;
+                                -- ? KHÔNG t?ng bit_cnt n?a - FSM s?ch h?n
+                            else
+                                -- Ch?a xong - ti?p t?c t?ng bit_cnt
+                                bit_cnt <= bit_cnt + 1;
+                            end if;
+                        end if;
+                        
+                        -- FALLING edge: Shift TX và update MOSI
+                        if sclk_fall = '1' then
+                            shift_reg_tx <= shift_reg_tx(DATA_WIDTH-2 downto 0) & '0';
+                            mosi_reg     <= shift_reg_tx(DATA_WIDTH-2);
+                        end if;
+
+                    when HOLD =>
+                        transfer_active <= '0';
+                        cs_active       <= '1';
+                        mosi_reg        <= '0';
+                        done_pulse      <= '1';
+                        state           <= IDLE;
+                        
+                end case;
+            end if;
+        end if;
+    end process;
+
+    -- Sticky Flags
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if rst_n = '0' then
+                busy_sticky_reg <= '0';
+                done_sticky_reg <= '0';
+                
+            elsif clear_flags = '1' then
+                busy_sticky_reg <= '0';
+                done_sticky_reg <= '0';
+                
+            else
+                if state = IDLE and start = '1' then
+                    busy_sticky_reg <= '1';
+                end if;
+                
+                if done_pulse = '1' then
+                    done_sticky_reg <= '1';
+                    busy_sticky_reg <= '0';
+                end if;
+            end if;
+        end if;
+    end process;
+
+    -- Cycle Counter
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if rst_n = '0' then
+                cycle_cnt          <= (others => '0');
+                cycle_cnt_snapshot <= (others => '0');
+                counting_active    <= '0';
+                
+            else
+                if state = IDLE and start = '1' then
+                    cycle_cnt       <= to_unsigned(1, 16);
+                    counting_active <= '1';
+                
+                elsif counting_active = '1' and state /= IDLE then
+                    cycle_cnt <= cycle_cnt + 1;
+                    
+                    if state = HOLD then
+                        cycle_cnt_snapshot <= cycle_cnt;
+                    end if;
+                
+                elsif state = IDLE then
+                    counting_active <= '0';
+                end if;
+            end if;
+        end if;
+    end process;
+
+end rtl;
